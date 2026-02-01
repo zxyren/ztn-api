@@ -242,7 +242,16 @@ def events():
                 if client_queue in sse_clients:
                     sse_clients.remove(client_queue)
     
-    return Response(event_stream(), mimetype="text/event-stream")
+    # return Response(event_stream(), mimetype="text/event-stream")
+    return Response(
+        event_stream(),
+        mimetype="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no"
+        }
+)
+
 
 @app.route("/api/download/<int:item_id>")
 def download_file(item_id):
@@ -305,17 +314,10 @@ def index():
             "/api/clear"
         ]
     })
+    
+# Start workers for Gunicorn & production
+start_workers()
 
 if __name__ == "__main__":
-    start_workers()
-    port = int(os.environ.get("PORT", 5000))
-    print(f"Starting Flask server on port {port}")
-    print(f"Available routes:")
-    print(f"  - GET  /")
-    print(f"  - GET  /status")
-    print(f"  - GET  /events (SSE - real-time updates)")
-    print(f"  - POST /queue")
-    print(f"  - POST /upload")
-    print(f"  - GET  /download/<id>")
-    print(f"  - POST /clear")
-    app.run(host="0.0.0.0", port=port, debug=False)
+    port = int(os.environ.get("PORT", 8000))
+    app.run(host="0.0.0.0", port=port)
