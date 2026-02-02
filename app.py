@@ -7,7 +7,6 @@ from queue import Queue
 from flask import Flask, request, jsonify, send_file, Response
 from flask_cors import CORS
 from yt_dlp import YoutubeDL
-from yt_dlp.networking.impersonate import ImpersonateTarget
 import shutil
 import subprocess
 import json
@@ -84,6 +83,9 @@ def ydl_options(progress_cb):
         'noverifyhttpscert': True,
         'buffersize': 1024 * 64,
         'continuedl': True,
+        'http_headers': {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        }
     }
     
     if FFMPEG_PATH:
@@ -93,13 +95,6 @@ def ydl_options(progress_cb):
         # Fallback to single format if FFmpeg not available
         print("⚠ FFmpeg not available - downloading single format only")
         opts['format'] = 'best'  # Download best single format (no merging needed)
-
-    try:
-        opts['impersonate'] = ImpersonateTarget.from_str('chrome')
-    except Exception:
-        opts['http_headers'] = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        }
 
     return opts
 
