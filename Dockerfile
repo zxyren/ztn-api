@@ -32,7 +32,7 @@ RUN pip install \
 
 WORKDIR /app
 
-COPY cookies.txt /app/cookies.txt
+COPY cookies.txt /cookies.txt
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
