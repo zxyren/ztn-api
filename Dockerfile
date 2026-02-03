@@ -8,28 +8,28 @@ RUN apt-get update && apt-get install -y \
     ca-certificates \
     build-essential \
     wget \
-    quickjs \
+    curl \
     xz-utils \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Deno (JS runtime for yt-dlp)
-RUN apt-get update && apt-get install -y curl \
-    && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
     && apt-get install -y nodejs \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/* \
     && node -v
 
-# Install required Python dependencies globally
-RUN pip install --upgrade pip
-RUN pip install \
-    yt-dlp \
+# Upgrade pip and install Python dependencies
+RUN pip install --no-cache-dir --upgrade pip
+
+RUN pip install --no-cache-dir \
     flask \
     flask-cors \
     gunicorn \
     pycryptodomex \
-    quickjs \
     websockets \
     brotli \
-    certifi
+    certifi \
+    curl-cffi
 
 WORKDIR /app
 
@@ -41,4 +41,4 @@ COPY . .
 
 EXPOSE 8000
 
-CMD ["gunicorn", "-w", "1", "-k", "gthread", "--threads", "4", "--timeout", "300", "-b", "0.0.0.0:8000", "app:app"]
+CMD ["gunicorn", "-w", "2", "-k", "gthread", "--threads", "4", "--timeout", "300", "-b", "0.0.0.0:8000", "app:app"]
