@@ -11,6 +11,9 @@ import shutil
 import subprocess
 import json
 import logging
+import requests  # Add this import
+from io import BytesIO  # Add this import
+
 
 app = Flask(__name__)
 CORS(app)  # Enable CORS for React frontend
@@ -343,11 +346,50 @@ def get_thumbnail():
                         if low_quality else min(thumbs, key=lambda x: x.get('width', 999999))['url'])
         thumbnail = thumbnail or info.get('thumbnail')
         if thumbnail:
-            return jsonify({"thumbnail": thumbnail, "title": info.get('title', '')})
+            return jsonify({
+                "thumbnailUrl": thumbnail,  # Changed from "thumbnail" to "thumbnailUrl"
+                "title": info.get('title', '')
+            })
         return jsonify({"error": "No thumbnail"}), 404
     except Exception as e:
         print(f"Error: {url} - {e}")
         return jsonify({"error": str(e)}), 500
+
+# NEW: Image proxy route to bypass CORS
+@app.route("/api/thumbnail/image", methods=["GET"])
+def get_thumbnail_image():
+    thumbnail_url = request.args.get("url", "").strip()
+    if not thumbnail_url:
+        return jsonify({"error": "No URL provided"}), 400
+    
+    try:
+        response = requests.get(
+            thumbnail_url,
+            headers={
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'Referer': 'https://www.youtube.com/'  # Some platforms check this
+            },
+            timeout=15,
+            stream=True
+        )
+        response.raise_for_status()
+        
+        # Get content type from response or default to jpeg
+        content_type = response.headers.get('Content-Type', 'image/jpeg')
+        
+        # Return the image with proper content type
+        return send_file(
+            BytesIO(response.content),
+            mimetype=content_type,
+            as_attachment=False,
+            max_age=3600  # Cache for 1 hour
+        )
+    except requests.exceptions.RequestException as e:
+        print(f"Error fetching thumbnail image: {e}")
+        return jsonify({"error": str(e)}), 500
+    except Exception as e:
+        print(f"Unexpected error: {e}")
+        return jsonify({"error": "Failed to fetch image"}), 500
     
 # Start workers for Gunicorn & production
 start_workers()
