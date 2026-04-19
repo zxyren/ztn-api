@@ -3,8 +3,9 @@ import threading
 import time
 import tempfile
 import glob
+import uuid
 from queue import Queue
-from flask import Flask, request, jsonify, send_file, Response
+from flask import Flask, request, jsonify, send_file, Response, session
 from flask_cors import CORS
 from yt_dlp import YoutubeDL
 import shutil
@@ -13,6 +14,7 @@ import json
 import logging
 
 app = Flask(__name__)
+app.secret_key = os.environ.get("SECRET_KEY", os.urandom(24))
 CORS(app)  # Enable CORS for React frontend
 
 # Disable Flask's request logging for the SSE endpoint
@@ -24,8 +26,38 @@ DOWNLOAD_FOLDER = tempfile.mkdtemp(prefix="video_downloader_")
 os.makedirs(DOWNLOAD_FOLDER, exist_ok=True)
 print(f"✓ Temporary download folder: {DOWNLOAD_FOLDER}")
 
+# Per-session downloads tracking
+user_downloads = {}  # {session_id: {"total": 0, "completed": 0, ...}}
+user_next_ids = {}   # {session_id: next_id}
+user_task_queues = {}  # {session_id: Queue}
+session_lock = threading.Lock()
+
+# SSE client management - map session_id to list of queues
+sse_clients = {}  # {session_id: [client_queues]}
+sse_lock = threading.Lock()
+
+def get_session_id():
+    """Get or create session ID for current request"""
+    if 'session_id' not in session:
+        session['session_id'] = str(uuid.uuid4())
+    return session['session_id']
+
+def ensure_session_initialized(session_id):
+    """Ensure session has download tracking initialized"""
+    with session_lock:
+        if session_id not in user_downloads:
+            user_downloads[session_id] = {
+                "total": 0,
+                "completed": 0,
+                "downloading": 0,
+                "queue": []
+            }
+            user_next_ids[session_id] = 1
+            user_task_queues[session_id] = Queue()
+            sse_clients[session_id] = []
+
 def detect_ffmpeg():
-    # Check if ffmpeg exists in PATH
+    """Check if ffmpeg exists in PATH"""
     ffmpeg_path = shutil.which("ffmpeg")
     if ffmpeg_path:
         print(f"✓ FFmpeg detected at {ffmpeg_path}")
@@ -47,31 +79,18 @@ def detect_ffmpeg():
 FFMPEG_PATH = detect_ffmpeg()
 MAX_CONCURRENT = 1
 
-downloads = {
-    "total": 0,
-    "completed": 0,
-    "downloading": 0,
-    "queue": []
-}
-next_id = 1
-task_queue = Queue()
-state_lock = threading.Lock()
-
-# SSE client management
-sse_clients = []
-sse_lock = threading.Lock()
-
-def broadcast_update():
-    """Send update to all connected SSE clients"""
-    with state_lock:
-        data = json.dumps(downloads)
+def broadcast_update(session_id):
+    """Send update to all connected SSE clients for this session"""
+    with session_lock:
+        data = json.dumps(user_downloads.get(session_id, {}))
     
     with sse_lock:
-        for client_queue in sse_clients[:]:
+        clients = sse_clients.get(session_id, [])
+        for client_queue in clients[:]:
             try:
                 client_queue.put(data)
             except:
-                sse_clients.remove(client_queue)
+                clients.remove(client_queue)
 
 def ydl_options(progress_cb):
     opts = {
@@ -100,7 +119,7 @@ def ydl_options(progress_cb):
     return opts
 
 
-def download_one(item):
+def download_one(item, session_id):
     downloaded_filename = None
     
     def progress_hook(d):
@@ -108,15 +127,15 @@ def download_one(item):
             total = d.get('total_bytes') or d.get('total_bytes_estimate')
             if total:
                 pct = d.get('downloaded_bytes', 0) * 100.0 / total
-                with state_lock:
+                with session_lock:
                     item['progress'] = max(0.0, min(100.0, pct))
                     item['status'] = 'Downloading'
-                broadcast_update()  # Send update to clients
+                broadcast_update(session_id)  # Send update to this user only
         elif d['status'] == 'finished':
-            with state_lock:
+            with session_lock:
                 item['progress'] = 100.0
                 item['status'] = 'Merging'
-            broadcast_update()  # Send update to clients
+            broadcast_update(session_id)  # Send update to this user only
             # Capture the filename when download finishes
             if 'filename' in d:
                 nonlocal downloaded_filename
@@ -139,95 +158,118 @@ def download_one(item):
             if files:
                 downloaded_filename = max(files, key=os.path.getmtime)
         
-        with state_lock:
+        with session_lock:
             item['status'] = 'Completed'
             item['filename'] = os.path.basename(downloaded_filename) if downloaded_filename else None
             item['filepath'] = downloaded_filename if downloaded_filename else None
-            downloads['completed'] += 1
-        broadcast_update()  # Send update to clients
+            user_downloads[session_id]['completed'] += 1
+        broadcast_update(session_id)  # Send update to this user only
     except Exception as e:
         print(f"--- DOWNLOAD FAILED: {str(e)} ---")
-        with state_lock:
+        with session_lock:
             item['status'] = 'Error'
             item['error'] = str(e)
-        broadcast_update()  # Send update to clients
+        broadcast_update(session_id)  # Send update to this user only
 
-def worker_loop():
+def worker_loop(session_id):
+    task_queue = user_task_queues[session_id]
     while True:
         url = task_queue.get()
         if url is None:
             break
-        with state_lock:
-            downloads['downloading'] += 1
-            item = next((x for x in downloads['queue'] if x['url']==url and x['status']=='Queued'), None)
+        with session_lock:
+            user_downloads[session_id]['downloading'] += 1
+            item = next((x for x in user_downloads[session_id]['queue'] if x['url']==url and x['status']=='Queued'), None)
             if item:
                 item['status'] = 'Starting'
-        broadcast_update()  # Send update to clients
+        broadcast_update(session_id)  # Send update to this user only
         if item:
-            download_one(item)
+            download_one(item, session_id)
         time.sleep(0.2)
-        with state_lock:
-            downloads['downloading'] -= 1
-        broadcast_update()  # Send update to clients
+        with session_lock:
+            user_downloads[session_id]['downloading'] -= 1
+        broadcast_update(session_id)  # Send update to this user only
         task_queue.task_done()
 
 def start_workers():
-    for _ in range(MAX_CONCURRENT):
-        threading.Thread(target=worker_loop, daemon=True).start()
+    # Workers are started per-session on demand
+    pass
 
 # API Routes
 @app.route("/api/queue", methods=["POST"])
 def queue_download():
-    global next_id
+    session_id = get_session_id()
+    ensure_session_initialized(session_id)
+    
     data = request.get_json(force=True, silent=True) or {}
     urls = data.get("urls", [])
-    with state_lock:
+    with session_lock:
         for raw_url in urls:
             url = (raw_url or "").strip()
             if not url:
                 continue
-            item = {"id": next_id, "url": url, "status": "Queued", "progress": 0.0}
-            next_id += 1
-            downloads['queue'].append(item)
-            downloads['total'] += 1
-            task_queue.put(url)
-    broadcast_update()  # Send update to clients
-    return jsonify(downloads)
+            item = {"id": user_next_ids[session_id], "url": url, "status": "Queued", "progress": 0.0}
+            user_next_ids[session_id] += 1
+            user_downloads[session_id]['queue'].append(item)
+            user_downloads[session_id]['total'] += 1
+            user_task_queues[session_id].put(url)
+        
+        # Start worker thread for this session if not already running
+        if not hasattr(user_downloads[session_id], '_worker_started'):
+            for _ in range(MAX_CONCURRENT):
+                threading.Thread(target=worker_loop, args=(session_id,), daemon=True).start()
+            user_downloads[session_id]['_worker_started'] = True
+    
+    broadcast_update(session_id)  # Send update to this user only
+    return jsonify(user_downloads[session_id])
 
 @app.route("/api/upload", methods=["POST"])
 def upload_file():
-    global next_id
+    session_id = get_session_id()
+    ensure_session_initialized(session_id)
+    
     f = request.files.get("file")
     if not f:
         return jsonify({"error": "No file"}), 400
     lines = [ln.strip() for ln in f.read().decode("utf-8", errors="ignore").splitlines() if ln.strip()]
-    with state_lock:
+    with session_lock:
         for url in lines:
-            item = {"id": next_id, "url": url, "status": "Queued", "progress": 0.0}
-            next_id += 1
-            downloads['queue'].append(item)
-            downloads['total'] += 1
-            task_queue.put(url)
-    broadcast_update()  # Send update to clients
-    return jsonify(downloads)
+            item = {"id": user_next_ids[session_id], "url": url, "status": "Queued", "progress": 0.0}
+            user_next_ids[session_id] += 1
+            user_downloads[session_id]['queue'].append(item)
+            user_downloads[session_id]['total'] += 1
+            user_task_queues[session_id].put(url)
+        
+        # Start worker thread for this session if not already running
+        if not hasattr(user_downloads[session_id], '_worker_started'):
+            for _ in range(MAX_CONCURRENT):
+                threading.Thread(target=worker_loop, args=(session_id,), daemon=True).start()
+            user_downloads[session_id]['_worker_started'] = True
+    
+    broadcast_update(session_id)  # Send update to this user only
+    return jsonify(user_downloads[session_id])
 
 @app.route("/api/status")
 def status():
-    with state_lock:
-        return jsonify(downloads)
+    session_id = get_session_id()
+    ensure_session_initialized(session_id)
+    return jsonify(user_downloads[session_id])
 
 @app.route("/api/events")
 def events():
-    """Server-Sent Events endpoint for real-time updates"""
+    """Server-Sent Events endpoint for real-time updates - session isolated"""
+    session_id = get_session_id()
+    ensure_session_initialized(session_id)
+    
     def event_stream():
         client_queue = Queue()
         with sse_lock:
-            sse_clients.append(client_queue)
+            sse_clients[session_id].append(client_queue)
         
         try:
-            # Send initial state
-            with state_lock:
-                data = json.dumps(downloads)
+            # Send initial state for this session
+            with session_lock:
+                data = json.dumps(user_downloads[session_id])
             yield f"data: {data}\n\n"
             
             # Send updates as they occur
@@ -236,10 +278,9 @@ def events():
                 yield f"data: {data}\n\n"
         except GeneratorExit:
             with sse_lock:
-                if client_queue in sse_clients:
-                    sse_clients.remove(client_queue)
+                if client_queue in sse_clients[session_id]:
+                    sse_clients[session_id].remove(client_queue)
     
-    # return Response(event_stream(), mimetype="text/event-stream")
     return Response(
         event_stream(),
         mimetype="text/event-stream",
@@ -247,14 +288,17 @@ def events():
             "Cache-Control": "no-cache",
             "X-Accel-Buffering": "no"
         }
-)
+    )
 
 
 @app.route("/api/download/<int:item_id>")
 def download_file(item_id):
-    """Serve the downloaded file to trigger browser download"""
-    with state_lock:
-        item = next((x for x in downloads['queue'] if x['id'] == item_id), None)
+    """Serve the downloaded file to trigger browser download - session isolated"""
+    session_id = get_session_id()
+    ensure_session_initialized(session_id)
+    
+    with session_lock:
+        item = next((x for x in user_downloads[session_id]['queue'] if x['id'] == item_id), None)
     
     if not item:
         return jsonify({"error": "Item not found"}), 404
@@ -271,11 +315,12 @@ def download_file(item_id):
 
 @app.route("/api/clear", methods=["POST"])
 def clear_downloads():
-    global next_id
+    session_id = get_session_id()
+    ensure_session_initialized(session_id)
     
-    with state_lock:
+    with session_lock:
         # Clean up old files before clearing
-        for item in downloads['queue']:
+        for item in user_downloads[session_id]['queue']:
             filepath = item.get('filepath')
             if filepath and os.path.exists(filepath):
                 try:
@@ -283,19 +328,21 @@ def clear_downloads():
                 except:
                     pass
         
-        downloads['total'] = 0
-        downloads['completed'] = 0
-        downloads['downloading'] = 0
-        downloads['queue'] = []
-        next_id = 1
+        user_downloads[session_id]['total'] = 0
+        user_downloads[session_id]['completed'] = 0
+        user_downloads[session_id]['downloading'] = 0
+        user_downloads[session_id]['queue'] = []
+        user_next_ids[session_id] = 1
         # Clear the task queue
+        task_queue = user_task_queues[session_id]
         while not task_queue.empty():
             try:
                 task_queue.get_nowait()
             except:
                 break
-    broadcast_update()  # Send update to clients
-    return jsonify(downloads)
+    
+    broadcast_update(session_id)  # Send update to this user only
+    return jsonify(user_downloads[session_id])
 
 # Add a root route for testing
 @app.route("/")
@@ -319,6 +366,9 @@ def index():
 # thumbnail extraction route
 @app.route("/api/thumbnail", methods=["POST"])
 def get_thumbnail():
+    session_id = get_session_id()
+    ensure_session_initialized(session_id)
+    
     url = (request.get_json(force=True, silent=True) or {}).get("url", "").strip()
     if not url:
         return jsonify({"error": "No URL provided"}), 400
