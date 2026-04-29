@@ -1,5 +1,4 @@
-import os, threading, time, tempfile, glob, json, logging, shutil, subprocess, uuid
-from queue import Queue
+import os, threading, time, glob, json, logging, shutil, subprocess, uuid, sqlite3
 from flask import Flask, request, jsonify, send_file, Response, session as flask_session
 from flask_cors import CORS
 from yt_dlp import YoutubeDL
@@ -9,7 +8,7 @@ CORS(app, supports_credentials=True)
 app.secret_key = os.environ.get("FLASK_SECRET_KEY") or os.urandom(32)
 logging.getLogger('werkzeug').setLevel(logging.ERROR)
 
-DOWNLOAD_FOLDER = tempfile.mkdtemp(prefix="ydl_")
+DOWNLOAD_FOLDER = os.environ.get("DOWNLOAD_FOLDER") or os.path.join(os.path.dirname(__file__), "downloads")
 os.makedirs(DOWNLOAD_FOLDER, exist_ok=True)
 
 # Detect ffmpeg
@@ -20,49 +19,97 @@ if not FFMPEG:
         FFMPEG = "ffmpeg"
     except Exception:
         pass
-print(f"✓ ffmpeg: {FFMPEG or 'NOT FOUND'}")
+print(f"ffmpeg: {FFMPEG or 'NOT FOUND'}")
 
 MAX_CONCURRENT = 1
-state_lock = threading.Lock()
-sse_lock = threading.Lock()
-task_queue = Queue()
-sse_clients_by_session = {}  # session_id -> [Queue(), ...]
-cancelled_ids = set()
-next_id = 1
-downloads_by_session = {}  # session_id -> {"total":..,"completed":..,"downloading":..,"queue":[...]} 
-items_by_id = {}  # item_id -> item dict (includes session_id)
+DB_PATH = os.environ.get("DB_PATH") or os.path.join(os.path.dirname(__file__), "downloads.db")
+db_claim_lock = threading.Lock()
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-def broadcast():
-    with state_lock:
-        snapshots = {sid: st.copy() for sid, st in downloads_by_session.items()}
-    with sse_lock:
-        for sid, clients in sse_clients_by_session.items():
-            st = snapshots.get(sid)
-            if st is None:
-                continue
-            data = json.dumps(st)
-            for q in clients[:]:
-                try:
-                    q.put(data)
-                except Exception:
-                    if q in clients:
-                        clients.remove(q)
+def init_db():
+    conn = sqlite3.connect(DB_PATH, timeout=30)
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA synchronous=NORMAL;")
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS downloads (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT,
+            url TEXT NOT NULL,
+            format TEXT NOT NULL,
+            status TEXT NOT NULL,
+            progress REAL DEFAULT 0.0,
+            error TEXT,
+            filename TEXT,
+            filepath TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_downloads_session ON downloads(session_id);")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_downloads_status ON downloads(status);")
+    conn.commit()
+    conn.close()
 
 
-def get_item(item_id):
-    return items_by_id.get(item_id)
+def get_db_conn():
+    conn = sqlite3.connect(DB_PATH, timeout=30, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
 
 
 def ensure_session_downloads(session_id: str):
     session_id = session_id or "unknown"
-    return downloads_by_session.setdefault(
-        session_id, {"total": 0, "completed": 0, "downloading": 0, "queue": []}
-    )
+    conn = get_db_conn()
+    try:
+        total = conn.execute(
+            "SELECT COUNT(*) FROM downloads WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()[0]
+        completed = conn.execute(
+            "SELECT COUNT(*) FROM downloads WHERE session_id = ? AND status = 'Completed'",
+            (session_id,),
+        ).fetchone()[0]
+        downloading = conn.execute(
+            """
+            SELECT COUNT(*) FROM downloads
+            WHERE session_id = ?
+              AND status IN ('Starting','Downloading','Converting','Merging')
+            """,
+            (session_id,),
+        ).fetchone()[0]
+
+        rows = conn.execute(
+            """
+            SELECT id, url, status, progress, format, filename, error
+            FROM downloads
+            WHERE session_id = ?
+            ORDER BY created_at DESC
+            """,
+            (session_id,),
+        ).fetchall()
+
+        queue = [
+            {
+                "id": int(r["id"]),
+                "session_id": session_id,
+                "url": r["url"],
+                "status": r["status"],
+                "progress": float(r["progress"] or 0.0),
+                "format": r["format"],
+                "filename": r["filename"],
+                "error": r["error"],
+            }
+            for r in rows
+        ]
+        return {"total": total, "completed": completed, "downloading": downloading, "queue": queue}
+    finally:
+        conn.close()
 
 
 def get_session_id(create_if_missing: bool = True) -> str:
@@ -118,47 +165,67 @@ def build_ydl_opts(progress_hook, format_type):
 # Download worker
 # ---------------------------------------------------------------------------
 
-def download_one(item):
-    item_id = item["id"]
-    session_id = item.get("session_id") or "unknown"
-    format_type = item.get("format", "video")
+def download_one(item_id: int, session_id: str, url: str, format_type: str):
+    """
+    Download + (optional) extract audio, then persist output + state in SQLite.
+    """
+    conn = get_db_conn()
     final_file = None
+    last_pct = None
+    last_update_ts = 0.0
 
     def hook(d):
-        nonlocal final_file
-        with state_lock:
-            if item_id in cancelled_ids:
-                raise Exception("Cancelled")
+        nonlocal final_file, last_pct, last_update_ts
         if d["status"] == "downloading":
             total = d.get("total_bytes") or d.get("total_bytes_estimate")
-            if total:
-                pct = round(d["downloaded_bytes"] * 100.0 / total, 1)
-                with state_lock:
-                    item["progress"] = max(0.0, min(100.0, pct))
-                    item["status"] = "Downloading"
-                broadcast()
+            if not total:
+                return
+            pct = round(d["downloaded_bytes"] * 100.0 / total, 1)
+            now = time.time()
+
+            # Throttle DB writes so SQLite isn't hammered during large downloads.
+            if last_pct is not None and pct == last_pct and (now - last_update_ts) < 1.0:
+                return
+
+            last_pct = pct
+            last_update_ts = now
+
+            current = conn.execute("SELECT status FROM downloads WHERE id = ?", (item_id,)).fetchone()
+            if current and current["status"] == "Cancelled":
+                raise Exception("Cancelled")
+
+            conn.execute(
+                "UPDATE downloads SET status=?, progress=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                ("Downloading", max(0.0, min(100.0, pct)), item_id),
+            )
+            conn.commit()
+
         elif d["status"] == "finished":
-            with state_lock:
-                item["progress"] = 100.0
-                item["status"] = "Converting" if format_type == "audio" else "Merging"
-            broadcast()
+            status = "Converting" if format_type == "audio" else "Merging"
+            conn.execute(
+                "UPDATE downloads SET status=?, progress=100.0, updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                (status, item_id),
+            )
+            conn.commit()
             final_file = d.get("filename")
 
     try:
-        opts = build_ydl_opts(hook, format_type)
-    except RuntimeError as e:
-        with state_lock:
-            item["status"], item["error"] = "Error", str(e)
-        broadcast()
-        return
+        try:
+            opts = build_ydl_opts(hook, format_type)
+        except RuntimeError as e:
+            conn.execute(
+                "UPDATE downloads SET status='Error', error=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                (str(e), item_id),
+            )
+            conn.commit()
+            return
 
-    try:
         with YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(item["url"], download=False)
+            info = ydl.extract_info(url, download=False)
             expected = ydl.prepare_filename(info)
-            ydl.download([item["url"]])
+            ydl.download([url])
 
-        # Resolve output file
+        # Resolve output file (same heuristics as your original code).
         if format_type == "audio":
             base = os.path.splitext(expected)[0]
             mp3 = base + ".mp3"
@@ -178,55 +245,78 @@ def download_one(item):
         if os.path.getsize(final_file) < 1024:
             raise Exception("Output file too small — download likely failed")
 
-        with state_lock:
-            item["status"] = "Completed"
-            item["filename"] = os.path.basename(final_file)
-            item["filepath"] = final_file
-            ensure_session_downloads(session_id)["completed"] += 1
-        broadcast()
+        conn.execute(
+            """
+            UPDATE downloads
+            SET status='Completed',
+                progress=100.0,
+                filename=?,
+                filepath=?,
+                error=NULL,
+                updated_at=CURRENT_TIMESTAMP
+            WHERE id=?
+            """,
+            (os.path.basename(final_file), final_file, item_id),
+        )
+        conn.commit()
 
     except Exception as e:
         msg = str(e)
-        with state_lock:
-            item["status"] = "Cancelled" if "cancelled" in msg.lower() else "Error"
-            item["error"] = msg
-            if "cancelled" in msg.lower() and final_file and os.path.exists(final_file):
-                try: os.remove(final_file)
-                except Exception: pass
-        broadcast()
+        is_cancel = "cancelled" in msg.lower()
+
+        conn.execute(
+            "UPDATE downloads SET status=?, error=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
+            ("Cancelled" if is_cancel else "Error", msg, item_id),
+        )
+        conn.commit()
+
+        # Cleanup partial output when cancelling.
+        if is_cancel and final_file and os.path.exists(final_file):
+            try:
+                os.remove(final_file)
+            except Exception:
+                pass
+    finally:
+        conn.close()
 
 
 def worker_loop():
     while True:
-        item_id = task_queue.get()
-        if item_id is None:
-            break
+        item = None
+        try:
+            with db_claim_lock:
+                conn = get_db_conn()
+                conn.execute("BEGIN IMMEDIATE")
+                row = conn.execute(
+                    """
+                    SELECT id, session_id, url, format
+                    FROM downloads
+                    WHERE status='Queued'
+                    ORDER BY created_at
+                    LIMIT 1
+                    """
+                ).fetchone()
+                if not row:
+                    conn.commit()
+                    conn.close()
+                    time.sleep(0.5)
+                    continue
 
-        with state_lock:
-            if item_id in cancelled_ids:
-                cancelled_ids.discard(item_id)
-                task_queue.task_done()
-                continue
-            item = get_item(item_id)
-            session_id = item.get("session_id") if item else "unknown"
-            ensure_session_downloads(session_id)["downloading"] += 1
-            if item and item["status"] == "Queued":
-                item["status"] = "Starting"
-        # Broadcast outside state_lock (broadcast() itself takes state_lock).
+                conn.execute(
+                    "UPDATE downloads SET status='Starting', progress=0.0, updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                    (row["id"],),
+                )
+                conn.commit()
+                item = row
+                conn.close()
+        except sqlite3.OperationalError:
+            # Database may be locked if you have multiple instances; wait and retry.
+            time.sleep(0.5)
+            continue
+
         if item:
-            broadcast()
-
-        if item:
-            download_one(item)
-
+            download_one(int(item["id"]), item["session_id"], item["url"], item["format"])
         time.sleep(0.1)
-        with state_lock:
-            st = downloads_by_session.get(session_id)
-            if st:
-                st["downloading"] = max(0, st["downloading"] - 1)
-            cancelled_ids.discard(item_id)
-        broadcast()
-        task_queue.task_done()
 
 
 def start_workers():
@@ -244,78 +334,95 @@ def sid():
 
 @app.route("/api/queue", methods=["POST"])
 def queue_download():
-    global next_id
     data = request.get_json(force=True, silent=True) or {}
     format_type = data.get("format", "video")
     session_id = sid()
-    with state_lock:
-        st = ensure_session_downloads(session_id)
+    conn = get_db_conn()
+    try:
         for url in [u.strip() for u in data.get("urls", []) if u.strip()]:
-            item = {"id": next_id, "session_id": session_id, "url": url, "status": "Queued", "progress": 0.0, "format": format_type}
-            st["queue"].append(item)
-            st["total"] += 1
-            items_by_id[next_id] = item
-            task_queue.put(next_id)
-            next_id += 1
-    broadcast()
-    return jsonify(st)
+            conn.execute(
+                "INSERT INTO downloads(session_id, url, format, status, progress) VALUES (?, ?, ?, 'Queued', 0.0)",
+                (session_id, url, format_type),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+    return jsonify(ensure_session_downloads(session_id))
 
 
 @app.route("/api/upload", methods=["POST"])
 def upload_file():
-    global next_id
     session_id = sid()
     f = request.files.get("file")
     if not f:
         return jsonify({"error": "No file"}), 400
     format_type = request.form.get("format", "video")
     lines = [l.strip() for l in f.read().decode("utf-8", errors="ignore").splitlines() if l.strip()]
-    with state_lock:
-        st = ensure_session_downloads(session_id)
+    conn = get_db_conn()
+    try:
         for url in lines:
-            item = {"id": next_id, "session_id": session_id, "url": url, "status": "Queued", "progress": 0.0, "format": format_type}
-            st["queue"].append(item)
-            st["total"] += 1
-            items_by_id[next_id] = item
-            task_queue.put(next_id)
-            next_id += 1
-    broadcast()
-    return jsonify(st)
+            conn.execute(
+                "INSERT INTO downloads(session_id, url, format, status, progress) VALUES (?, ?, ?, 'Queued', 0.0)",
+                (session_id, url, format_type),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+    return jsonify(ensure_session_downloads(session_id))
 
 
 @app.route("/api/status")
 def status():
     session_id = sid()
-    with state_lock:
-        return jsonify(ensure_session_downloads(session_id))
+    return jsonify(ensure_session_downloads(session_id))
 
 
 @app.route("/api/cancel/<int:item_id>", methods=["POST"])
 def cancel(item_id):
     session_id = sid()
-    with state_lock:
-        item = get_item(item_id)
-        if not item:
+    conn = get_db_conn()
+    try:
+        row = conn.execute(
+            "SELECT session_id, status FROM downloads WHERE id=?",
+            (item_id,),
+        ).fetchone()
+        if not row:
             return jsonify({"error": "Not found"}), 404
-        if item.get("session_id") != session_id:
+        if row["session_id"] != session_id:
             return jsonify({"error": "Not allowed"}), 403
-        if item["status"] in ("Completed", "Error", "Cancelled"):
-            return jsonify({"error": f"Cannot cancel — status is {item['status']}"}), 400
-        cancelled_ids.add(item_id)
-        item["status"] = "Cancelling"
-    broadcast()
+        if row["status"] in ("Completed", "Error", "Cancelled"):
+            return jsonify({"error": f"Cannot cancel — status is {row['status']}"}), 400
+
+        conn.execute(
+            "UPDATE downloads SET status='Cancelled', error='Cancelled by user', updated_at=CURRENT_TIMESTAMP WHERE id=?",
+            (item_id,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
     return jsonify(ensure_session_downloads(session_id))
 
 
 @app.route("/api/download/<int:item_id>")
 def download_file(item_id):
-    session_id = sid()
-    with state_lock:
-        item = get_item(item_id)
+    conn = get_db_conn()
+    try:
+        item = conn.execute(
+            """
+            SELECT status, filepath, filename
+            FROM downloads
+            WHERE id=?
+            """,
+            (item_id,),
+        ).fetchone()
+    finally:
+        conn.close()
+
     if not item:
         return jsonify({"error": "Not found"}), 404
-    if item.get("session_id") != session_id:
-        return jsonify({"error": "Not allowed"}), 403
+
+    # Important: do NOT require the same session cookie for downloads.
+    # This fixes "copied link disappears" after production where session cookies can differ.
     if item["status"] != "Completed":
         return jsonify({"error": "Not ready"}), 400
     fp = item.get("filepath")
@@ -326,23 +433,26 @@ def download_file(item_id):
 
 @app.route("/api/clear", methods=["POST"])
 def clear():
-    global next_id
     session_id = sid()
-    with state_lock:
-        st = ensure_session_downloads(session_id)
-        for item in st["queue"]:
-            fp = item.get("filepath")
+    conn = get_db_conn()
+    try:
+        rows = conn.execute(
+            "SELECT id, filepath, status FROM downloads WHERE session_id=?",
+            (session_id,),
+        ).fetchall()
+        for r in rows:
+            fp = r["filepath"]
             if fp and os.path.exists(fp):
-                try: os.remove(fp)
-                except Exception: pass
-            # If queued/downloading, prevent worker from starting it.
-            if item.get("status") not in ("Completed", "Error", "Cancelled"):
-                cancelled_ids.add(item.get("id"))
-                item["status"] = "Cancelled"
-                item["error"] = item.get("error") or "Cleared"
-        st.update({"total": 0, "completed": 0, "downloading": 0, "queue": []})
-        # Don't reset next_id and don't clear the global task queue, to keep other sessions running.
-    broadcast()
+                try:
+                    os.remove(fp)
+                except Exception:
+                    pass
+
+        # Mimic your original behavior: remove queued/completed items from the UI.
+        conn.execute("DELETE FROM downloads WHERE session_id=?", (session_id,))
+        conn.commit()
+    finally:
+        conn.close()
     return jsonify(ensure_session_downloads(session_id))
 
 
@@ -350,19 +460,16 @@ def clear():
 def events():
     session_id = sid()
     def stream():
-        q = Queue()
-        with sse_lock:
-            sse_clients_by_session.setdefault(session_id, []).append(q)
-        try:
-            with state_lock:
-                yield f"data: {json.dumps(ensure_session_downloads(session_id))}\n\n"
-            while True:
-                yield f"data: {q.get()}\n\n"
-        except GeneratorExit:
-            with sse_lock:
-                clients = sse_clients_by_session.get(session_id, [])
-                if q in clients:
-                    clients.remove(q)
+        # Simple DB-polling SSE. This works across multiple app instances
+        # (your previous in-memory broadcast could break on production).
+        last_payload = None
+        while True:
+            st = ensure_session_downloads(session_id)
+            payload = json.dumps(st, sort_keys=True)
+            if payload != last_payload:
+                last_payload = payload
+                yield f"data: {payload}\n\n"
+            time.sleep(1)
     return Response(stream(), mimetype="text/event-stream",
                     headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
@@ -397,6 +504,7 @@ def index():
         return jsonify({"status": "Video Downloader API running"})
 
 
+init_db()
 start_workers()
 
 if __name__ == "__main__":
