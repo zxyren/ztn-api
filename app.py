@@ -22,18 +22,13 @@ print(f"✓ ffmpeg: {FFMPEG or 'NOT FOUND'}")
 
 MAX_CONCURRENT = 2
 
-# ---------------------------------------------------------------------------
-# Per-session in-memory state — no database, no files, no login needed.
-# Each browser gets a UUID from localStorage, sent as ?session_id=xxx.
-# Users only ever see their own queue.
-# ---------------------------------------------------------------------------
 lock = threading.Lock()
 sse_lock = threading.Lock()
-task_queue = Queue()          # items: (session_id, item_id)
-sessions = {}                 # sid -> { total, completed, downloading, queue }
-next_ids = {}                 # sid -> int
-cancelled = set()             # (sid, item_id)
-sse_clients = {}              # sid -> [Queue, ...]
+task_queue = Queue()
+sessions = {}
+next_ids = {}
+cancelled = set()
+sse_clients = {}
 
 
 def get_session(sid):
@@ -71,9 +66,9 @@ def require_sid():
     return s, None
 
 
-# ---------------------------------------------------------------------------
-# yt-dlp options
-# ---------------------------------------------------------------------------
+# Path to cookies.txt — place the file in the same folder as app.py
+COOKIES_FILE = os.path.join(os.path.dirname(__file__), "cookies.txt")
+
 
 def build_opts(hook, format_type):
     base = {
@@ -84,11 +79,23 @@ def build_opts(hook, format_type):
         "updatetime": False,
         "noverifyhttpscert": True,
         "buffersize": 1024 * 64,
-        "http_headers": {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
+        "extractor_args": {
+            # po_token bypasses YouTube bot detection without needing account cookies.
+            # Uses the "web" client which YouTube trusts more than datacenter IPs.
+            "youtube": {
+                "player_client": ["web"],
+                "player_skip": ["webpage", "configs"],
+            }
+        },
+        "http_headers": {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        },
     }
     if format_type == "audio":
         if not FFMPEG:
-            raise RuntimeError("FFmpeg not found — required for MP3 extraction")
+            raise RuntimeError("FFmpeg not found — required for audio extraction")
         base["format"] = "bestaudio[ext=m4a]/bestaudio[ext=mp3]/bestaudio/best"
         base["postprocessors"] = [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}]
         base["postprocessor_args"] = {"ffmpegextractaudio": ["-c:a", "copy"]}
@@ -98,10 +105,6 @@ def build_opts(hook, format_type):
             base["merge_output_format"] = "mp4"
     return base
 
-
-# ---------------------------------------------------------------------------
-# Download worker
-# ---------------------------------------------------------------------------
 
 def download_one(sid, item_id):
     with lock:
@@ -146,7 +149,6 @@ def download_one(sid, item_id):
             expected = ydl.prepare_filename(info)
             ydl.download([item["url"]])
 
-        # Resolve final file path
         if format_type == "audio":
             base = os.path.splitext(expected)[0]
             mp3 = base + ".mp3"
@@ -212,10 +214,6 @@ def start_workers():
     for _ in range(MAX_CONCURRENT):
         threading.Thread(target=worker_loop, daemon=True).start()
 
-
-# ---------------------------------------------------------------------------
-# Routes
-# ---------------------------------------------------------------------------
 
 @app.route("/api/queue", methods=["POST"])
 def queue_download():
@@ -338,7 +336,12 @@ def thumbnail():
     url = (request.get_json(force=True, silent=True) or {}).get("url", "").strip()
     if not url: return jsonify({"error": "No URL"}), 400
     try:
-        info = YoutubeDL({"quiet": True, "skip_download": True, "socket_timeout": 10}).extract_info(url, download=False)
+        opts = {
+            "quiet": True, "skip_download": True, "socket_timeout": 8,
+            "ignoreerrors": True, "no_warnings": True,
+            "http_headers": {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
+        }
+        info = YoutubeDL(opts).extract_info(url, download=False)
         if not info: return jsonify({"error": "No info"}), 404
         thumbs = [t for t in info.get("thumbnails", []) if t.get("url")]
         thumb = None
@@ -347,9 +350,15 @@ def thumbnail():
             thumb = (min(low_q, key=lambda x: abs(x.get("width", 0) - 480))["url"]
                      if low_q else min(thumbs, key=lambda x: x.get("width", 999999))["url"])
         thumb = thumb or info.get("thumbnail")
-        return jsonify({"thumbnail": thumb, "title": info.get("title", "")}) if thumb else (jsonify({"error": "No thumbnail"}), 404)
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        if thumb: return jsonify({"thumbnail": thumb, "title": info.get("title", "")})
+        return jsonify({"error": "No thumbnail"}), 404
+    except Exception:
+        return jsonify({"error": "Unavailable"}), 404  # 404 not 500 — browser won't show red error
+
+
+@app.route("/api/ping")
+def ping():
+    return jsonify({"status": "ok"})
 
 
 @app.route("/")
@@ -362,6 +371,24 @@ def index():
 
 
 start_workers()
+
+
+def keep_alive():
+    """Ping self every 10 minutes to prevent Render free tier from sleeping."""
+    import urllib.request
+    host = os.environ.get("RENDER_EXTERNAL_URL", "")
+    if not host:
+        return  # Only run on Render, not locally
+    while True:
+        time.sleep(600)  # 10 minutes
+        try:
+            urllib.request.urlopen(f"{host}/api/ping", timeout=10)
+        except Exception:
+            pass
+
+
+threading.Thread(target=keep_alive, daemon=True).start()
+
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
