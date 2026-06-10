@@ -130,24 +130,45 @@ def download_image(sid, item_id):
                 fname = f"{dyn_title}_{item_id}{ext}"
             else:
                 fname = os.path.basename(fp)
+            metadata = get_file_metadata(fp, "image")
+            with lock:
+                item.update(status="Completed", progress=100.0,
+                            filename=fname, filepath=fp, image_count=1, metadata=metadata)
+                sessions[sid]["completed"] += 1
+            broadcast(sid)
         else:
-            if dyn_title:
-                fname = f"{dyn_title}_{item_id}.zip"
+            if not item.get("as_zip", True):
+                fnames = []
+                for i, f in enumerate(files):
+                    ext = os.path.splitext(f)[1]
+                    if dyn_title:
+                        fnames.append(f"{dyn_title}_{item_id}_{i+1}{ext}")
+                    else:
+                        fnames.append(os.path.basename(f))
+                metadata = get_file_metadata(files[0], "image")
+                with lock:
+                    item.update(status="Completed", progress=100.0,
+                                filenames=fnames, filepaths=files, image_count=len(files), metadata=metadata)
+                    sessions[sid]["completed"] += 1
+                broadcast(sid)
             else:
-                fname = f"images_{item_id}.zip"
+                if dyn_title:
+                    fname = f"{dyn_title}_{item_id}.zip"
+                else:
+                    fname = f"images_{item_id}.zip"
 
-            fp = os.path.join(DOWNLOAD_FOLDER, fname)
-            with zipfile.ZipFile(fp, "w", zipfile.ZIP_DEFLATED) as z:
-                for f in files:
-                    z.write(f, os.path.relpath(f, out_dir))
+                fp = os.path.join(DOWNLOAD_FOLDER, fname)
+                with zipfile.ZipFile(fp, "w", zipfile.ZIP_DEFLATED) as z:
+                    for f in files:
+                        z.write(f, os.path.relpath(f, out_dir))
 
-        metadata = get_file_metadata(fp, "image")
+                metadata = get_file_metadata(fp, "image")
 
-        with lock:
-            item.update(status="Completed", progress=100.0,
-                        filename=fname, filepath=fp, image_count=len(files), metadata=metadata)
-            sessions[sid]["completed"] += 1
-        broadcast(sid)
+                with lock:
+                    item.update(status="Completed", progress=100.0,
+                                filename=fname, filepath=fp, image_count=len(files), metadata=metadata)
+                    sessions[sid]["completed"] += 1
+                broadcast(sid)
 
     except Exception as e:
         upd("Cancelled" if "Cancelled" in str(e) else "Error", error=str(e))
@@ -243,12 +264,13 @@ def queue_download():
     if err: return err
     data = request.get_json(force=True, silent=True) or {}
     fmt = data.get("format", "video")
+    as_zip = data.get("as_zip", True)
     with lock:
         d = get_session(sid)
         for url in [u.strip() for u in data.get("urls", []) if u.strip()]:
             iid = next_ids[sid]; next_ids[sid] += 1
             d["queue"].append({"id": iid, "url": url, "status": "Queued",
-                               "progress": 0.0, "format": fmt})
+                               "progress": 0.0, "format": fmt, "as_zip": as_zip})
             d["total"] += 1
             task_queue.put((sid, iid))
     broadcast(sid)
@@ -262,13 +284,14 @@ def upload_file():
     f = request.files.get("file")
     if not f: return jsonify({"error": "No file"}), 400
     fmt = request.form.get("format", "video")
+    as_zip = request.form.get("as_zip", "true").lower() == "true"
     lines = [l.strip() for l in f.read().decode("utf-8", errors="ignore").splitlines() if l.strip()]
     with lock:
         d = get_session(sid)
         for url in lines:
             iid = next_ids[sid]; next_ids[sid] += 1
             d["queue"].append({"id": iid, "url": url, "status": "Queued",
-                               "progress": 0.0, "format": fmt})
+                               "progress": 0.0, "format": fmt, "as_zip": as_zip})
             d["total"] += 1
             task_queue.put((sid, iid))
     broadcast(sid)
@@ -297,9 +320,23 @@ def download_file(item_id):
     with lock: item = get_item(sid, item_id)
     if not item: return jsonify({"error": "Not found"}), 404
     if item["status"] != "Completed": return jsonify({"error": "Not ready"}), 400
-    fp = item.get("filepath")
+    
+    idx = request.args.get("index", 0, type=int)
+    
+    if "filepaths" in item and "filenames" in item:
+        fps = item["filepaths"]
+        fnames = item["filenames"]
+        if 0 <= idx < len(fps):
+            fp = fps[idx]
+            fname = fnames[idx]
+        else:
+            return jsonify({"error": "Index out of range"}), 404
+    else:
+        fp = item.get("filepath")
+        fname = item.get("filename", "download")
+
     if not fp or not os.path.exists(fp): return jsonify({"error": "File missing"}), 404
-    return send_file(fp, as_attachment=True, download_name=item.get("filename", "download"))
+    return send_file(fp, as_attachment=True, download_name=fname)
 
 
 @app.route("/api/remove/<int:item_id>", methods=["POST"])
